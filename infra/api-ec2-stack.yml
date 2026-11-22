@@ -106,11 +106,12 @@ Resources:
     Type: AWS::EC2::Instance
     Metadata:
       com.aws.cloudformation.Context:
-        why: Hosts both Java containers and Nginx on the existing Academy profile; AL2023 provides a stable dnf-based bootstrap.
+        why: Hosts both Java containers and Nginx on the existing Academy profile; exact users route and configurable path prefixes proxy to their respective loopback APIs.
         must:
           - Attach the existing LabInstanceProfile; do not create IAM resources.
           - Keep the root EBS volume encrypted and require IMDSv2.
           - Keep API listeners on loopback and expose only Nginx through the security group.
+          - Route the exact /api/mi-foro/usuarios path to SecondApiPort, MiForoNginxPath to MiForoPort, and SecondApiNginxPath to SecondApiPort.
         mutable: change-with-constraints
         mutability:
           IamInstanceProfile: must-never-change
@@ -151,7 +152,7 @@ Resources:
               listen ${NginxListenPort} default_server;
               server_name _;
 
-              # API mi_foro (puerto 8082)
+              # Exact route for mi_foro_usuarios (port 8081)
               location = /api/mi-foro/usuarios {
                   proxy_pass http://127.0.0.1:${SecondApiPort};
                   proxy_set_header Host $host;
@@ -160,7 +161,16 @@ Resources:
                   proxy_set_header X-Forwarded-Proto $scheme;
               }
 
-              # API mi_foro_usuarios (puerto 8081)
+              # Prefix for mi_foro (port 8082)
+              location ${MiForoNginxPath} {
+                  proxy_pass http://127.0.0.1:${MiForoPort};
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              # General prefix for mi_foro_usuarios (port 8081)
               location ${SecondApiNginxPath} {
                   proxy_pass http://127.0.0.1:${SecondApiPort};
                   proxy_set_header Host $host;
