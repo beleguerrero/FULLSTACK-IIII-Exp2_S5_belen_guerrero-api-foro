@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Hosts two Java APIs behind configurable Nginx routes while reusing the existing
+  LabInstanceProfile and network.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    arch: One EC2 host runs Docker and Nginx; Nginx proxies two configurable paths to loopback API ports.
+    must:
+      - Use the pre-existing LabInstanceProfile; do not create or modify IAM roles or instance profiles.
+      - Select an existing VPC and a public subnet in that VPC.
+      - Keep Oracle wallet files and application secrets outside this template and instance bootstrap data.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC for the API host.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing public subnet in the selected VPC.
+
+  InstanceType:
+    Type: String
+    Description: EC2 instance size; confirm availability and Academy quotas in the target account.
+    Default: t3.medium
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: Amazon Linux 2023 x86_64 AMI parameter.
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  AllowedHttpCidr:
+    Type: String
+    Description: Approved client IPv4 CIDR allowed to reach Nginx; avoid unrestricted access.
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$'
+    ConstraintDescription: Specify an IPv4 CIDR range.
+
+  NginxListenPort:
+    Type: Number
+    Description: External HTTP port used by Nginx.
+    Default: 80
+    MinValue: 1
+    MaxValue: 65535
+
+  MiForoPort:
+    Type: Number
+    Description: Local listening port of mi_foro.
+    Default: 8082
+    MinValue: 1
+    MaxValue: 65535
+
+  SecondApiPort:
+    Type: Number
+    Description: Local listening port of the second API.
+    Default: 8081
+    MinValue: 1
+    MaxValue: 65535
+
+  MiForoNginxPath:
+    Type: String
+    Description: Nginx path prefix for mi_foro.
+    Default: /api/mi-foro/
+    AllowedPattern: '^/[A-Za-z0-9._~/-]+/$'
+    ConstraintDescription: Use a slash-delimited path prefix, for example /api/mi-foro/.
+
+  SecondApiNginxPath:
+    Type: String
+    Description: Required Nginx path prefix for the second API; supply its actual route.
+    AllowedPattern: '^/[A-Za-z0-9._~/-]+/$'
+    ConstraintDescription: Use a slash-delimited path prefix for the second API.
+
+Resources:
+  ApiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Expose only the Nginx listener; the two API ports remain unpublished.
+        must:
+          - Restrict inbound HTTP to the approved client CIDR.
+          - Do not add direct inbound rules for the API ports.
+        mutable: change-with-constraints
+    Properties:
+      GroupDescription: Allow approved HTTP clients to reach the API reverse proxy.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref NginxListenPort
+          ToPort: !Ref NginxListenPort
+          CidrIp: !Ref AllowedHttpCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-api-host-sg'
+
+  ApiInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Hosts both Java containers and Nginx on the existing Academy profile; AL2023 provides a stable dnf-based bootstrap.
+        must:
+          - Attach the existing LabInstanceProfile; do not create IAM resources.
+          - Keep the root EBS volume encrypted and require IMDSv2.
+          - Keep API listeners on loopback and expose only Nginx through the security group.
+        mutable: change-with-constraints
+        mutability:
+          IamInstanceProfile: must-never-change
+          MetadataOptions: must-never-change
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: LabInstanceProfile
+      EbsOptimized: true
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref ApiSecurityGroup
+          SubnetId: !Ref SubnetId
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            VolumeSize: 30
+            VolumeType: gp3
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+
+          dnf install -y docker nginx
+          systemctl enable --now docker
+
+          cat > /etc/nginx/conf.d/api-proxy.conf <<'NGINX'
+          server {
+              listen ${NginxListenPort} default_server;
+              server_name _;
+
+              location ${MiForoNginxPath} {
+                  proxy_pass http://127.0.0.1:${MiForoPort};
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              location ${SecondApiNginxPath} {
+                  proxy_pass http://127.0.0.1:${SecondApiPort};
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              location / {
+                  return 404;
+              }
+          }
+          NGINX
+
+          rm -f /etc/nginx/conf.d/default.conf
+          nginx -t
+          systemctl enable --now nginx
+          systemctl enable --now amazon-ssm-agent
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-api-host'
+        - Key: Application
+          Value: java-apis
+
+Outputs:
+  InstanceId:
+    Description: EC2 instance identifier.
+    Value: !Ref ApiInstance
+
+  PublicIp:
+    Description: Public IPv4 address assigned to the EC2 network interface.
+    Value: !GetAtt ApiInstance.PublicIp
+
+  MiForoProxyBaseUrl:
+    Description: Nginx base URL for the configured mi_foro path prefix.
+    Value: !Sub 'http://${ApiInstance.PublicIp}:${NginxListenPort}${MiForoNginxPath}'
+
+  SecondApiProxyBaseUrl:
+    Description: Nginx base URL for the configured second API path prefix.
+    Value: !Sub 'http://${ApiInstance.PublicIp}:${NginxListenPort}${SecondApiNginxPath}'

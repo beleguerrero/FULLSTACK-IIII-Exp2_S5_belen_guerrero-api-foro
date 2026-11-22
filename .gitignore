@@ -41,3 +41,17 @@ build/
 .env
 .env.*
 !.env.example
+
+# Oracle wallet and local TNS configuration
+**/wallet/
+**/wallet*/
+**/Wallet_*/
+**/cwallet.sso
+**/ewallet.*
+**/*.p12
+**/*.jks
+**/tnsnames.ora
+**/sqlnet.ora
+CLAUDE.md
+.cursor/rules/aws.mdc
+.github/copilot-instructions.md
