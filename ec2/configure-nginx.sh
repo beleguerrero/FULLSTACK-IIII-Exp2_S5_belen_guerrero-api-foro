@@ -1,137 +1,136 @@
 
-name: Configure Nginx on EC2
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-on:
-  workflow_dispatch:
+NGINX_LISTEN_PORT="${NGINX_LISTEN_PORT:-80}"
+NGINX_CONF_DIR="/etc/nginx/conf.d"
+NGINX_CONF="${NGINX_CONF_DIR}/api-proxy.conf"
+BACKUP_DIR="/var/backups/nginx"
+TEMP_CONF=""
 
-permissions:
-  contents: read
+log() {
+    printf 'configure-nginx: %s\n' "$*"
+}
 
-concurrency:
-  group: configure-nginx-ec2
-  cancel-in-progress: false
+fail() {
+    log "ERROR: $*" >&2
+    exit 1
+}
 
-jobs:
-  configure-nginx:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+cleanup() {
+    if [[ -n "${TEMP_CONF:-}" && -f "$TEMP_CONF" ]]; then
+        rm -f "$TEMP_CONF"
+    fi
+}
 
-    env:
-      AWS_REGION: us-east-1
-      EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
-      NGINX_LISTEN_PORT: "80"
+trap cleanup EXIT
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+[[ "$EUID" -eq 0 ]] || fail "Este script debe ejecutarse como root."
 
-      - name: Validate configuration
-        shell: bash
-        run: |
-          set -euo pipefail
+command -v nginx >/dev/null 2>&1 || fail "Nginx no está instalado."
+systemctl is-active --quiet nginx || fail "Nginx no está activo."
 
-          [[ "$EC2_INSTANCE_ID" =~ ^i-[0-9a-f]{8,17}$ ]] || {
-            echo "::error::EC2_INSTANCE_ID is missing or invalid."
-            exit 1
-          }
+[[ "$NGINX_LISTEN_PORT" =~ ^[0-9]{1,5}$ ]] \
+    || fail "Puerto inválido: $NGINX_LISTEN_PORT"
 
-          [[ -f ec2/configure-nginx.sh ]] || {
-            echo "::error::configure-nginx.sh was not found."
-            exit 1
-          }
+(( NGINX_LISTEN_PORT >= 1 && NGINX_LISTEN_PORT <= 65535 )) \
+    || fail "Puerto fuera de rango."
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: ${{ env.AWS_REGION }}
+mkdir -p "$NGINX_CONF_DIR" "$BACKUP_DIR"
 
-      - name: Verify AWS and SSM access
-        shell: bash
-        run: |
-          set -euo pipefail
+BACKUP_FILE="${BACKUP_DIR}/api-proxy.conf.$(date -u +%Y%m%d-%H%M%S).$$.bak"
 
-          aws sts get-caller-identity
+if [[ -f "$NGINX_CONF" ]]; then
+    cp -p "$NGINX_CONF" "$BACKUP_FILE"
+    log "Respaldo creado: $BACKUP_FILE"
+fi
 
-          aws ssm describe-instance-information \
-            --filters "Key=InstanceIds,Values=$EC2_INSTANCE_ID" \
-            --query 'InstanceInformationList[0].PingStatus' \
-            --output text
+TEMP_CONF="$(mktemp "${NGINX_CONF_DIR}/.api-proxy.conf.XXXXXX")"
 
-      - name: Prepare remote script
-        id: prepare
-        shell: bash
-        run: |
-          set -euo pipefail
+cat > "$TEMP_CONF" <<EOF
+server {
+    listen ${NGINX_LISTEN_PORT};
+    server_name _;
 
-          SCRIPT_B64="$(gzip -c ec2/configure-nginx.sh | base64 -w0)"
+    client_max_body_size 10m;
 
-          REMOTE_COMMAND="set -eu; remote_script=\$(mktemp /tmp/configure-nginx.XXXXXX); trap 'rm -f -- \"\$remote_script\"' EXIT; printf '%s' '$SCRIPT_B64' | base64 --decode | gzip --decompress > \"\$remote_script\"; chmod 700 \"\$remote_script\"; sudo env NGINX_LISTEN_PORT='$NGINX_LISTEN_PORT' bash \"\$remote_script\""
+    location = /api/mi-foro/usuarios {
+        proxy_pass http://127.0.0.1:8081;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
 
-          jq -n \
-            --arg command "$REMOTE_COMMAND" \
-            '{commands: [$command], executionTimeout: ["900"]}' \
-            > "$RUNNER_TEMP/ssm-parameters.json"
+    location /api/mi-foro/ {
+        proxy_pass http://127.0.0.1:8082;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
 
-      - name: Execute Nginx configuration through SSM
-        id: ssm
-        shell: bash
-        run: |
-          set -euo pipefail
+    location /api/ {
+        proxy_pass http://127.0.0.1:8081;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
 
-          COMMAND_ID="$(aws ssm send-command \
-            --instance-ids "$EC2_INSTANCE_ID" \
-            --document-name AWS-RunShellScript \
-            --comment "Configure Nginx reverse proxy" \
-            --timeout-seconds 900 \
-            --parameters "file://$RUNNER_TEMP/ssm-parameters.json" \
-            --region "$AWS_REGION" \
-            --query 'Command.CommandId' \
-            --output text)"
+    location / {
+        return 404;
+    }
+}
+EOF
 
-          [[ "$COMMAND_ID" =~ ^[0-9a-f-]{36}$ ]] || {
-            echo "::error::SSM did not return a valid command ID."
-            exit 1
-          }
+chmod 644 "$TEMP_CONF"
 
-          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+if ! nginx -t; then
+    log "La configuración nueva no es válida."
 
-          for attempt in $(seq 1 90); do
-            STATUS="$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$EC2_INSTANCE_ID" \
-              --region "$AWS_REGION" \
-              --query 'Status' \
-              --output text 2>/dev/null || true)"
+    if [[ -f "$BACKUP_FILE" ]]; then
+        cp -p "$BACKUP_FILE" "$NGINX_CONF"
+    else
+        rm -f "$NGINX_CONF"
+    fi
 
-            case "$STATUS" in
-              Success)
-                echo "Nginx configuration completed successfully."
-                aws ssm get-command-invocation \
-                  --command-id "$COMMAND_ID" \
-                  --instance-id "$EC2_INSTANCE_ID" \
-                  --region "$AWS_REGION" \
-                  --query 'StandardOutputContent' \
-                  --output text
-                exit 0
-                ;;
-              Failed|Cancelled|TimedOut|Cancelling)
-                echo "::error::SSM command finished with status: $STATUS"
-                aws ssm get-command-invocation \
-                  --command-id "$COMMAND_ID" \
-                  --instance-id "$EC2_INSTANCE_ID" \
-                  --region "$AWS_REGION" \
-                  --query '[StandardOutputContent,StandardErrorContent]' \
-                  --output text || true
-                exit 1
-                ;;
-              *)
-                sleep 10
-                ;;
-            esac
-          done
+    nginx -t || true
+    fail "Se restauró la configuración anterior."
+fi
 
-          echo "::error::Timed out waiting for SSM command completion."
-          exit 1
+mv "$TEMP_CONF" "$NGINX_CONF"
+TEMP_CONF=""
+
+if ! nginx -t; then
+    log "Falló la validación después de instalar la configuración."
+
+    if [[ -f "$BACKUP_FILE" ]]; then
+        cp -p "$BACKUP_FILE" "$NGINX_CONF"
+    else
+        rm -f "$NGINX_CONF"
+    fi
+
+    systemctl reload nginx || true
+    fail "Se restauró la configuración anterior."
+fi
+
+if ! systemctl reload nginx; then
+    log "Falló la recarga de Nginx."
+
+    if [[ -f "$BACKUP_FILE" ]]; then
+        cp -p "$BACKUP_FILE" "$NGINX_CONF"
+    else
+        rm -f "$NGINX_CONF"
+    fi
+
+    nginx -t && systemctl reload nginx || true
+    fail "Se restauró la configuración anterior."
+fi
+
+log "Nginx configurado y recargado correctamente."
+log "Usuarios API: 127.0.0.1:8081"
+log "Foro API: 127.0.0.1:8082"
