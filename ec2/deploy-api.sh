@@ -19,6 +19,8 @@ Optional options:
   --container-name NAME           Defaults to the service ID
   --secret-id ID                  Secrets Manager name or ARN
   --secret-env-map MAP            Comma-separated ENV_NAME=JSON_KEY mappings
+  --second-secret-id ID           Optional second Secrets Manager name or ARN
+  --second-secret-env-map MAP     Comma-separated mappings for the second secret
   --profile PROFILE               Sets SPRING_PROFILES_ACTIVE
   --wallet-bucket BUCKET          S3 bucket containing the Oracle Wallet ZIP
   --wallet-key KEY                S3 object key for the Oracle Wallet ZIP
@@ -27,8 +29,9 @@ Optional options:
   --db-url-env-key NAME           URL variable to append TNS_ADMIN to (default: DB_URL)
   --help                          Show this help
 
-Wallet options are per deployment. If a wallet is supplied, a Secrets Manager
-mapping containing the configured DB URL variable is required.
+Both secret mapping options must be paired with their corresponding secret ID.
+Environment variable names must be unique across both mappings. Wallet options
+are per deployment; the combined mappings must include the configured DB URL.
 USAGE
 }
 
@@ -45,6 +48,8 @@ host_port=""
 container_port=""
 secret_id=""
 secret_env_map=""
+second_secret_id=""
+second_secret_env_map=""
 spring_profile=""
 wallet_bucket=""
 wallet_key=""
@@ -92,6 +97,16 @@ while (($#)); do
     --secret-env-map)
       (($# >= 2)) || fail "--secret-env-map requires a value."
       secret_env_map="$2"
+      shift 2
+      ;;
+    --second-secret-id)
+      (($# >= 2)) || fail "--second-secret-id requires a value."
+      second_secret_id="$2"
+      shift 2
+      ;;
+    --second-secret-env-map)
+      (($# >= 2)) || fail "--second-secret-env-map requires a value."
+      second_secret_env_map="$2"
       shift 2
       ;;
     --profile)
@@ -159,6 +174,10 @@ if [[ -n "$secret_id" && -z "$secret_env_map" ]] \
   || [[ -z "$secret_id" && -n "$secret_env_map" ]]; then
   fail "--secret-id and --secret-env-map must be supplied together."
 fi
+if [[ -n "$second_secret_id" && -z "$second_secret_env_map" ]] \
+  || [[ -z "$second_secret_id" && -n "$second_secret_env_map" ]]; then
+  fail "--second-secret-id and --second-secret-env-map must be supplied together."
+fi
 if [[ -n "$spring_profile" && ! "$spring_profile" =~ ^[A-Za-z0-9._-]+$ ]]; then
   fail "A valid --profile is required."
 fi
@@ -176,7 +195,8 @@ if [[ -n "$wallet_bucket" ]]; then
   esac
   [[ "$wallet_group_id" =~ ^[0-9]{1,10}$ ]] || fail "Invalid --wallet-group-id."
   (( 10#$wallet_group_id <= 4294967294 )) || fail "Invalid --wallet-group-id."
-  [[ "$secret_id" != "" ]] || fail "An Oracle Wallet deployment requires a Secrets Manager DB URL."
+  [[ -n "$secret_id" || -n "$second_secret_id" ]] \
+    || fail "An Oracle Wallet deployment requires a Secrets Manager DB URL."
   [[ "$db_url_env_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || fail "Invalid --db-url-env-key."
 fi
 if [[ "$service_id" == "mi_foro" ]]; then
@@ -315,14 +335,12 @@ aws ecr get-login-password --region "$region" \
 docker pull "$image_uri"
 rm -f -- "$docker_config/config.json"
 
-if [[ -n "$secret_id" ]]; then
-  env_file="$(mktemp /tmp/deploy-api-env.XXXXXX)"
-  tns_admin_path=""
-  if [[ -n "$wallet_bucket" ]]; then
-    tns_admin_path="$wallet_mount_path"
-  fi
+append_secret_to_env() {
+  local current_secret_id="$1"
+  local current_secret_env_map="$2"
+
   aws secretsmanager get-secret-value \
-    --secret-id "$secret_id" \
+    --secret-id "$current_secret_id" \
     --query SecretString \
     --output text \
     --region "$region" \
@@ -330,12 +348,19 @@ if [[ -n "$secret_id" ]]; then
 import json
 import re
 import sys
-from urllib.parse import unquote_plus, quote
 
-env_path, mapping_text, db_url_key, tns_admin_path, profile = sys.argv[1:]
+env_path, mapping_text = sys.argv[1:]
 secret = json.load(sys.stdin)
 if not isinstance(secret, dict):
     raise SystemExit("The selected secret must contain a JSON object.")
+
+existing_names = set()
+with open(env_path, "r", encoding="utf-8") as existing_file:
+    for line in existing_file:
+        name, separator, _ = line.rstrip("\n").partition("=")
+        if not separator or not name:
+            raise SystemExit("The temporary environment file is malformed.")
+        existing_names.add(name)
 
 values = {}
 for entry in mapping_text.split(","):
@@ -344,16 +369,50 @@ for entry in mapping_text.split(","):
     env_name, json_key = entry.split("=", 1)
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
         raise SystemExit("Invalid environment variable name in secret mapping.")
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", json_key) or env_name in values:
-        raise SystemExit("Invalid or duplicate secret field mapping.")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", json_key):
+        raise SystemExit("Invalid JSON key in secret environment mapping.")
+    if env_name in existing_names or env_name in values:
+        raise SystemExit(f"Duplicate environment variable mapping: {env_name}.")
     value = secret.get(json_key)
     if not isinstance(value, str) or not value or any(char in value for char in ("\n", "\r", "\0")):
         raise SystemExit(f"Secret field for {env_name} is missing or not a single-line string.")
     values[env_name] = value
 
+with open(env_path, "a", encoding="utf-8", newline="\n") as output:
+    for env_name, value in values.items():
+        output.write(f"{env_name}={value}\n")
+' "$env_file" "$current_secret_env_map"
+}
+
+if [[ -n "$secret_id" || -n "$second_secret_id" || -n "$spring_profile" ]]; then
+  env_file="$(mktemp /tmp/deploy-api-env.XXXXXX)"
+  if [[ -n "$secret_id" ]]; then
+    append_secret_to_env "$secret_id" "$secret_env_map"
+  fi
+  if [[ -n "$second_secret_id" ]]; then
+    append_secret_to_env "$second_secret_id" "$second_secret_env_map"
+  fi
+
+  tns_admin_path=""
+  if [[ -n "$wallet_bucket" ]]; then
+    tns_admin_path="$wallet_mount_path"
+  fi
+  python3 - "$env_file" "$db_url_env_key" "$tns_admin_path" "$spring_profile" <<'PY'
+import sys
+from urllib.parse import unquote_plus, quote
+
+env_path, db_url_key, tns_admin_path, profile = sys.argv[1:]
+values = {}
+with open(env_path, "r", encoding="utf-8") as environment_file:
+    for line in environment_file:
+        name, separator, value = line.rstrip("\n").partition("=")
+        if not separator or not name or name in values:
+            raise SystemExit("The combined environment mapping is invalid.")
+        values[name] = value
+
 if tns_admin_path:
     if db_url_key not in values:
-        raise SystemExit("The secret mapping must include the configured DB URL variable when using a wallet.")
+        raise SystemExit("The combined secret mappings must include the configured DB URL variable when using a wallet.")
     base, separator, query = values[db_url_key].partition("?")
     preserved = []
     for pair in (query.split("&") if separator else []):
@@ -368,16 +427,13 @@ if tns_admin_path:
 
 if profile:
     if "SPRING_PROFILES_ACTIVE" in values:
-        raise SystemExit("Do not map SPRING_PROFILES_ACTIVE from the secret when using --profile.")
+        raise SystemExit("Do not map SPRING_PROFILES_ACTIVE from a secret when using --profile.")
     values["SPRING_PROFILES_ACTIVE"] = profile
 
 with open(env_path, "w", encoding="utf-8", newline="\n") as output:
     for env_name, value in values.items():
         output.write(f"{env_name}={value}\n")
-' "$env_file" "$secret_env_map" "$db_url_env_key" "$tns_admin_path" "$spring_profile"
-elif [[ -n "$spring_profile" ]]; then
-  env_file="$(mktemp /tmp/deploy-api-env.XXXXXX)"
-  printf 'SPRING_PROFILES_ACTIVE=%s\n' "$spring_profile" > "$env_file"
+PY
 fi
 
 if [[ -n "$wallet_bucket" ]]; then

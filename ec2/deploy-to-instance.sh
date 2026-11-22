@@ -9,7 +9,8 @@ Usage:
 
 Deploy options are forwarded to HOST_SCRIPT. For deploy-api.sh, pass options such as
 --image, --container-name, --host-port, --container-port, --secret-id,
---secret-env-map, --profile, --wallet-bucket and --wallet-key.
+--secret-env-map, --second-secret-id, --second-secret-env-map, --profile,
+--wallet-bucket and --wallet-key.
 USAGE
 }
 
@@ -17,6 +18,11 @@ fail() {
   printf 'ERROR: %s\n' "$*" >&2
   exit 1
 }
+
+if (($# == 1)) && [[ "$1" == "--help" ]]; then
+  usage
+  exit 0
+fi
 
 if (($# < 4)); then
   usage >&2

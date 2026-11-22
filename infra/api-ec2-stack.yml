@@ -73,6 +73,7 @@ Parameters:
   SecondApiNginxPath:
     Type: String
     Description: Required Nginx path prefix for the second API; supply its actual route.
+    Default: /api/
     AllowedPattern: '^/[A-Za-z0-9._~/-]+/$'
     ConstraintDescription: Use a slash-delimited path prefix for the second API.
 
@@ -150,14 +151,16 @@ Resources:
               listen ${NginxListenPort} default_server;
               server_name _;
 
-              location ${MiForoNginxPath} {
-                  proxy_pass http://127.0.0.1:${MiForoPort};
+              # API mi_foro (puerto 8082)
+              location = /api/mi-foro/usuarios {
+                  proxy_pass http://127.0.0.1:${SecondApiPort};
                   proxy_set_header Host $host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
                   proxy_set_header X-Forwarded-Proto $scheme;
               }
 
+              # API mi_foro_usuarios (puerto 8081)
               location ${SecondApiNginxPath} {
                   proxy_pass http://127.0.0.1:${SecondApiPort};
                   proxy_set_header Host $host;
