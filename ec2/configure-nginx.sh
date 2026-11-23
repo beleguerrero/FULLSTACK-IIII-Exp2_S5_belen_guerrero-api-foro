@@ -82,7 +82,12 @@ server {
     }
 
     location / {
-        return 404;
+        proxy_pass http://127.0.0.1:4000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 EOF
@@ -132,5 +137,6 @@ if ! systemctl reload nginx; then
 fi
 
 log "Nginx configurado y recargado correctamente."
+log "Angular SSR: 127.0.0.1:4000"
 log "Usuarios API: 127.0.0.1:8081"
 log "Foro API: 127.0.0.1:8082"
